@@ -151,9 +151,9 @@ python -m dflash.benchmark --backend mlx \
 
 ---
 
-## ThermoDFlash: Thermodynamic Attention Draft Model
+## ThermoFlash: Thermodynamic Attention Draft Model
 
-This fork adds **ThermoDFlash** — an experimental variant that replaces the softmax attention kernel inside the DFlash draft model with a **mean-field Ising Gibbs sampler** inspired by [Thermodynamic Natural Gradient Descent](https://arxiv.org/html/2510.23972v1) and related thermodynamic computing work.
+This fork adds **ThermoFlash** — an experimental variant that replaces the softmax attention kernel inside the DFlash draft model with a **mean-field Ising Gibbs sampler** inspired by [Thermodynamic Natural Gradient Descent](https://arxiv.org/html/2510.23972v1) and related thermodynamic computing work.
 
 ### How it works
 
@@ -163,7 +163,7 @@ Standard DFlash draft attention computes:
 output = softmax(QKᵀ / √d) · V
 ```
 
-ThermoDFlash replaces that single softmax pass with **annealed Gibbs refinement**:
+ThermoFlash replaces that single softmax pass with **annealed Gibbs refinement**:
 
 ```
 h  = QKᵀ / √d               # external field (same as standard attention logits)
@@ -184,7 +184,7 @@ The key idea: **each Gibbs step lets the attention weights influence each other*
 
 **Kernel speed vs SDPA:**
 
-| Config | SDPA | ThermoDFlash | Overhead |
+| Config | SDPA | ThermoFlash | Overhead |
 |---|---|---|---|
 | B=4 q=4 kv=32 D=64 steps=1 | 0.008ms | 0.107ms | 13x |
 | B=4 q=4 kv=32 D=64 steps=4 | 0.008ms | 0.208ms | 25x |
@@ -195,22 +195,22 @@ The key idea: **each Gibbs step lets the attention weights influence each other*
 | Model | tok/s | Params |
 |---|---|---|
 | DFlash (softmax baseline) | 124,869 | 67.1M |
-| ThermoDFlash n_gibbs=1 | 18,385 | 67.4M |
-| ThermoDFlash n_gibbs=4 | 18,841 | 67.4M |
-| ThermoDFlash n_gibbs=8 | 18,470 | 67.4M |
+| ThermoFlash n_gibbs=1 | 18,385 | 67.4M |
+| ThermoFlash n_gibbs=4 | 18,841 | 67.4M |
+| ThermoFlash n_gibbs=8 | 18,470 | 67.4M |
 
 **Speculative decoding (100 distillation steps, block_size=4):**
 
 | Metric | Value |
 |---|---|
 | Baseline throughput | 82.4 tok/s |
-| ThermoDFlash throughput | 58.9 tok/s |
+| ThermoFlash throughput | 58.9 tok/s |
 | Avg acceptance length | 1.08 / 4 |
 | Speedup | 0.72x |
 
 ### Current status and next steps
 
-The 100-step distillation run produces an acceptance length of 1.08 — close to the untrained baseline of 1.0. The kernel overhead (~20x vs SDPA) is the primary bottleneck at this scale. To be competitive, ThermoDFlash needs:
+The 100-step distillation run produces an acceptance length of 1.08 — close to the untrained baseline of 1.0. The kernel overhead (~20x vs SDPA) is the primary bottleneck at this scale. To be competitive, ThermoFlash needs:
 
 1. **More distillation** — the original DFlash models train for thousands of steps; 100 is just a proof of life
 2. **Fused Gibbs kernel** — the per-step sigmoid + matmul loop in Python is slow; a fused CUDA/Triton kernel collapses n_steps overhead significantly

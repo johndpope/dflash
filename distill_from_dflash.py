@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 distill_from_dflash.py
-Distil a ThermoDFlash draft model from any pretrained DFlash checkpoint.
+Distil a ThermoFlash draft model from any pretrained DFlash checkpoint.
 
 Loads a pretrained DFlash draft model (e.g. z-lab/Qwen3.5-4B-DFlash), copies
 the shared weights (embeddings, layer norms, MLPs, Q/K/V projections) into a
@@ -58,7 +58,7 @@ import sys
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Distil ThermoDFlash from a pretrained DFlash model",
+        description="Distil ThermoFlash from a pretrained DFlash model",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -68,7 +68,7 @@ def main() -> int:
     parser.add_argument("--pretrained-dflash", required=True,
                         help="Pretrained DFlash draft model (HuggingFace ID or local path)")
     parser.add_argument("--output-dir",       required=True,
-                        help="Directory to save the distilled ThermoDFlash model")
+                        help="Directory to save the distilled ThermoFlash model")
 
     # Thermodynamic hyperparameters
     parser.add_argument("--n-gibbs-steps",    type=int,   default=4,
@@ -126,7 +126,7 @@ def main() -> int:
         cmd.append("--load-8bit")
 
     print("=" * 60)
-    print("ThermoDFlash distillation")
+    print("ThermoFlash distillation")
     print("=" * 60)
     print(f"  Target LLM      : {args.target}")
     print(f"  Pretrained DFlash: {args.pretrained_dflash}")

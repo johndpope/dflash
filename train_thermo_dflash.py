@@ -59,7 +59,7 @@ def make_thermo_config(target_config, args):
     """
     Build a Qwen3Config for ThermoDFlashDraftModel from the target config.
 
-    ThermoDFlash uses fewer layers than the target (same as original DFlash
+    ThermoFlash uses fewer layers than the target (same as original DFlash
     draft models: typically 1 or 2 decoder layers).
     """
     from transformers import Qwen3Config
@@ -154,8 +154,8 @@ def train(args):
 
     # ── Build draft model ─────────────────────────────────────────────────────
     if args.resume_from:
-        # Continue training an existing ThermoDFlash checkpoint
-        print(f"Resuming ThermoDFlash from: {args.resume_from}")
+        # Continue training an existing ThermoFlash checkpoint
+        print(f"Resuming ThermoFlash from: {args.resume_from}")
         draft = ThermoDFlashDraftModel.from_pretrained(
             args.resume_from, torch_dtype=torch.bfloat16,
         )
@@ -184,7 +184,7 @@ def train(args):
                   f"training with {args.draft_layers} layers")
             args.draft_layers = pretrained_layers
 
-        # Convert to ThermoDFlash by creating new config and copying weights
+        # Convert to ThermoFlash by creating new config and copying weights
         draft_config = make_thermo_config(target_config, args)
         draft = ThermoDFlashDraftModel(draft_config)
 
@@ -194,7 +194,7 @@ def train(args):
         missing_keys, unexpected_keys = draft.load_state_dict(
             pretrained_draft.state_dict(), strict=False
         )
-        print(f"  Converted DFlash → ThermoDFlash")
+        print(f"  Converted DFlash → ThermoFlash")
         print(f"    Missing keys (new, near-zero init): {len(missing_keys)}")
         print(f"    Unexpected keys (ignored):          {len(unexpected_keys)}")
     else:
@@ -394,7 +394,7 @@ def main():
     parser.add_argument("--pretrained-dflash", type=str, default=None,
                         help="Path to pretrained DFlash model to distill from (optional)")
     parser.add_argument("--resume-from",   type=str,   default=None,
-                        help="Resume training from a ThermoDFlash checkpoint")
+                        help="Resume training from a ThermoFlash checkpoint")
     parser.add_argument("--draft-layers",  type=int,   default=1,
                         help="Number of decoder layers in draft model (default 1)")
     parser.add_argument("--load-8bit",     action="store_true",

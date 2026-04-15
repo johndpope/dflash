@@ -55,7 +55,7 @@ DTYPE  = torch.bfloat16
 
 def port_weights(src: DFlashDraftModel, dst: ThermoDFlashDraftModel) -> tuple[int, int]:
     """
-    Copy all compatible weights from pre-trained DFlash into ThermoDFlash.
+    Copy all compatible weights from pre-trained DFlash into ThermoFlash.
 
     Compatible: every key in src that also exists in dst (all Q/K/V/O/MLP/
     norm/fc/rotary). The only keys in dst that DON'T exist in src are:
@@ -334,7 +334,7 @@ def train(args):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Warm-start ThermoDFlash from pre-trained z-lab DFlash checkpoint"
+        description="Warm-start ThermoFlash from pre-trained z-lab DFlash checkpoint"
     )
     p.add_argument("--draft",          default="z-lab/Qwen3-4B-DFlash-b16",
                    help="Pre-trained DFlashDraftModel (HF hub or local path)")

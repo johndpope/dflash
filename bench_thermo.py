@@ -5,7 +5,7 @@ Benchmark ThermoDFlashDraftModel vs standard DFlashDraftModel.
 Runs three benchmarks:
   1. Kernel speed: ThermoGibbsSampler vs scaled-dot-product attention
      across varying seq lengths, head dims, and n_gibbs_steps.
-  2. Draft model forward pass throughput (ThermoDFlash vs DFlash).
+  2. Draft model forward pass throughput (ThermoFlash vs DFlash).
   3. Mini speculative decoding acceptance rate with Qwen3-1.7B
      after a short distillation training run (~100 steps).
 """
@@ -105,7 +105,7 @@ def bench_draft_forward(target_hidden_size=2048, target_layers=28):
     from transformers import Qwen3Config
 
     print("=" * 60)
-    print("Benchmark 2: ThermoDFlash vs DFlash draft forward pass")
+    print("Benchmark 2: ThermoFlash vs DFlash draft forward pass")
     print("=" * 60)
 
     def make_config(num_draft_layers, thermo=False, n_gibbs=4):
@@ -222,7 +222,7 @@ def bench_acceptance(args):
 
     # ── Build or load draft ───────────────────────────────────────────────────
     if args.load_thermo:
-        print(f"\nLoading ThermoDFlash from checkpoint: {args.load_thermo}")
+        print(f"\nLoading ThermoFlash from checkpoint: {args.load_thermo}")
         draft = ThermoDFlashDraftModel.from_pretrained(
             args.load_thermo, torch_dtype=DTYPE,
         ).to(DEVICE).eval()
@@ -359,7 +359,7 @@ def bench_acceptance(args):
         t1 = time.perf_counter()
         baseline_times.append((t1 - t0) / r1.num_output_tokens)
 
-        # ThermoDFlash: block_size=N
+        # ThermoFlash: block_size=N
         t0 = time.perf_counter()
         with torch.inference_mode():
             rN = dflash_generate(
@@ -391,7 +391,7 @@ def bench_acceptance(args):
 
     print(f"\n{'=' * 60}")
     print(f"  Baseline throughput : {1000/baseline_tpot:>8.1f} tok/s")
-    print(f"  ThermoDFlash tp     : {1000/dflash_tpot:>8.1f} tok/s")
+    print(f"  ThermoFlash tp     : {1000/dflash_tpot:>8.1f} tok/s")
     print(f"  Decoding speedup    : {speedup:>8.2f}x")
     print(f"  Avg acceptance len  : {mean_accept:>8.2f}  (block_size={block_size})")
     print(f"  Acceptance histogram: {[f'{x*100:.1f}%' for x in histogram]}")
