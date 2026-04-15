@@ -227,6 +227,7 @@ def bench_acceptance(args):
             args.load_thermo, torch_dtype=DTYPE,
         ).to(DEVICE).eval()
         dcfg = draft.config
+        dcfg.block_size = args.block_size
     else:
         target_layer_ids = build_target_layer_ids(tcfg.num_hidden_layers, args.draft_layers)
         dcfg = Qwen3Config(
@@ -252,11 +253,11 @@ def bench_acceptance(args):
             "beta_start": args.beta_start,
             "beta_end": args.beta_end,
         }
-    dcfg.block_size = args.block_size
+        dcfg.block_size = args.block_size
+        draft = ThermoDFlashDraftModel(dcfg).to(DEVICE).to(DTYPE)
 
-    draft = ThermoDFlashDraftModel(dcfg).to(DEVICE).to(DTYPE)
     n_params = sum(p.numel() for p in draft.parameters() if p.requires_grad)
-    print(f"  Draft: {n_params/1e6:.2f}M params, {args.draft_layers}L, "
+    print(f"  Draft: {n_params/1e6:.2f}M params, {getattr(dcfg, 'num_hidden_layers', '?')}L, "
           f"{args.n_gibbs_steps} Gibbs steps")
 
     # ── Short distillation training ───────────────────────────────────────────
@@ -413,6 +414,7 @@ def main():
     parser.add_argument("--eval-prompts",  type=int,   default=6)
     parser.add_argument("--max-new-tokens",type=int,   default=64)
     parser.add_argument("--temperature",   type=float, default=0.0)
+    parser.add_argument("--load-thermo",   type=str,   default=None)
     parser.add_argument("--skip-kernel",   action="store_true")
     parser.add_argument("--skip-draft-fwd",action="store_true")
     parser.add_argument("--skip-acceptance",action="store_true")

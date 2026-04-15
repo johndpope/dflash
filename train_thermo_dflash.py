@@ -70,6 +70,9 @@ def make_thermo_config(target_config, args):
     # Draft model is shallow — 1-2 layers is typical in DFlash
     cfg.num_hidden_layers = args.draft_layers
     cfg.num_target_layers = target_config.num_hidden_layers
+    # layer_types must match num_hidden_layers exactly (Qwen3Config validates this)
+    if hasattr(cfg, "layer_types") and cfg.layer_types:
+        cfg.layer_types = list(cfg.layer_types)[:args.draft_layers]
 
     # DFlash-specific config
     target_layer_ids = build_target_layer_ids(
@@ -150,17 +153,78 @@ def train(args):
           f"hidden={target_config.hidden_size}, vocab={target_config.vocab_size}")
 
     # ── Build draft model ─────────────────────────────────────────────────────
-    print(f"Building ThermoDFlashDraftModel ({args.draft_layers} layers, "
-          f"{args.n_gibbs_steps} Gibbs steps, β={args.beta_start}→{args.beta_end})")
-    draft_config = make_thermo_config(target_config, args)
-    draft = ThermoDFlashDraftModel(draft_config).to(device)
+    if args.pretrained_dflash:
+        print(f"Loading pretrained DFlash model: {args.pretrained_dflash}")
+        from dflash.model import DFlashDraftModel
+
+        # Load the pretrained DFlash model
+        pretrained_draft = DFlashDraftModel.from_pretrained(
+            args.pretrained_dflash, torch_dtype=torch.bfloat16
+        )
+
+        # Check if layer count matches
+        pretrained_layers = len(pretrained_draft.layers)
+        if pretrained_layers != args.draft_layers:
+            print(f"  Warning: pretrained model has {pretrained_layers} layers, "
+                  f"training with {args.draft_layers} layers")
+            args.draft_layers = pretrained_layers
+
+        # Convert to ThermoDFlash by creating new config and copying weights
+        draft_config = make_thermo_config(target_config, args)
+        draft = ThermoDFlashDraftModel(draft_config)
+
+        # Copy all compatible weights (Q/K/V/O projections, norms, MLPs, fc, rotary).
+        # strict=False: Gibbs-only keys (J_proj, log_beta_offset) are absent in
+        # the DFlash checkpoint and will stay at their near-zero init.
+        missing_keys, unexpected_keys = draft.load_state_dict(
+            pretrained_draft.state_dict(), strict=False
+        )
+        print(f"  Converted DFlash → ThermoDFlash")
+        print(f"    Missing keys (new, near-zero init): {len(missing_keys)}")
+        print(f"    Unexpected keys (ignored):          {len(unexpected_keys)}")
+
+        # All params train, but at different rates:
+        #   Gibbs params (J_proj, log_beta_offset): high LR — learn coupling fast
+        #   DFlash backbone (Q/K/V/O, MLPs, norms): tiny LR — barely moves,
+        #     but does adapt to the new sigmoid-based attention mechanism.
+        # Pure freezing fails because downstream layers were trained for softmax
+        # attention output; the sigmoid Gibbs output is numerically different.
+        gibbs_param_names = {n for n, _ in draft.named_parameters()
+                             if "gibbs" in n}
+        n_gibbs    = sum(p.numel() for n, p in draft.named_parameters()
+                         if n in gibbs_param_names)
+        n_backbone = sum(p.numel() for n, p in draft.named_parameters()
+                         if n not in gibbs_param_names)
+        print(f"    Gibbs params (high LR):             {n_gibbs/1e6:.2f}M")
+        print(f"    Backbone params (tiny LR):          {n_backbone/1e6:.1f}M")
+    else:
+        print(f"Building ThermoDFlashDraftModel from scratch ({args.draft_layers} layers, "
+              f"{args.n_gibbs_steps} Gibbs steps, β={args.beta_start}→{args.beta_end})")
+        draft_config = make_thermo_config(target_config, args)
+        draft = ThermoDFlashDraftModel(draft_config)
+
+    # Match dtype to the target model so target_hidden flows through without casting
+    target_dtype = next(target.parameters()).dtype
+    draft = draft.to(device=device, dtype=target_dtype)
 
     n_params = sum(p.numel() for p in draft.parameters() if p.requires_grad)
     print(f"  Draft trainable params: {n_params/1e6:.2f}M")
 
-    # ── Optimizer ─────────────────────────────────────────────────────────────
-    optimizer = AdamW(draft.parameters(), lr=args.lr, weight_decay=1e-2)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=args.lr * 0.1)
+    # ── Optimizer — differential LR ──────────────────────────────────────────
+    if args.pretrained_dflash:
+        # Gibbs params: train at full LR (they're new, need to learn fast)
+        # Backbone params: train at LR/200 (barely move, just adapt to sigmoid attn)
+        gibbs_param_names = {n for n, _ in draft.named_parameters() if "gibbs" in n}
+        gibbs_params    = [p for n, p in draft.named_parameters() if n in gibbs_param_names]
+        backbone_params = [p for n, p in draft.named_parameters() if n not in gibbs_param_names]
+        optimizer = AdamW([
+            {"params": gibbs_params,    "lr": args.lr,        "weight_decay": 1e-2},
+            {"params": backbone_params, "lr": args.lr / 200,  "weight_decay": 1e-4},
+        ])
+        print(f"  Optimizer: Gibbs LR={args.lr:.1e}  Backbone LR={args.lr/200:.1e}")
+    else:
+        optimizer = AdamW(draft.parameters(), lr=args.lr, weight_decay=1e-2)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=args.lr * 0.05)
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     print(f"Loading dataset: {args.dataset}")
@@ -181,6 +245,7 @@ def train(args):
     data_idx    = 0
     losses      = []
     ce_losses   = []
+    kl_losses   = []
     t_start     = time.perf_counter()
 
     print(f"\nStarting distillation training — {args.steps} steps\n")
@@ -225,7 +290,9 @@ def train(args):
 
             noise_emb = target.model.embed_tokens(noise_ids)                 # (1, seq, D)
 
-            position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+            # pos_ids must span ctx_len + q_len so RoPE covers the full kv sequence
+            # (target_hidden and noise are concatenated as keys → 2 × seq_len positions)
+            position_ids = torch.arange(2 * seq_len, device=device).unsqueeze(0)
 
             # ── Draft forward ─────────────────────────────────────────────────
             draft_hidden = draft(
@@ -249,12 +316,15 @@ def train(args):
             # ── Backward ─────────────────────────────────────────────────────
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(draft.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(
+                [p for p in draft.parameters() if p.grad is not None], 1.0
+            )
             optimizer.step()
             scheduler.step()
 
             losses.append(float(losses_dict["loss"]))
             ce_losses.append(float(losses_dict["ce_loss"]))
+            kl_losses.append(float(losses_dict.get("kl_loss", 0.0)))
 
         except torch.cuda.OutOfMemoryError:
             optimizer.zero_grad()
@@ -267,11 +337,13 @@ def train(args):
         if step % args.log_every == 0:
             avg_loss    = np.mean(losses[-args.log_every:])
             avg_ce      = np.mean(ce_losses[-args.log_every:])
+            avg_kl      = np.mean(kl_losses[-args.log_every:])
             elapsed     = time.perf_counter() - t_start
             steps_per_s = step / elapsed
             pbar.set_postfix({
                 "loss":    f"{avg_loss:.4f}",
                 "ce":      f"{avg_ce:.4f}",
+                "kl":      f"{avg_kl:.4f}",
                 "lr":      f"{scheduler.get_last_lr()[0]:.2e}",
                 "step/s":  f"{steps_per_s:.1f}",
             })
@@ -314,6 +386,8 @@ def main():
     # Model
     parser.add_argument("--target",        type=str,   default="Qwen/Qwen3-4B",
                         help="Target HuggingFace model ID")
+    parser.add_argument("--pretrained-dflash", type=str, default=None,
+                        help="Path to pretrained DFlash model to distill from (optional)")
     parser.add_argument("--draft-layers",  type=int,   default=1,
                         help="Number of decoder layers in draft model (default 1)")
     parser.add_argument("--load-8bit",     action="store_true",
@@ -338,8 +412,8 @@ def main():
                         choices=["gsm8k", "math500", "humaneval", "mbpp", "mt-bench"])
     parser.add_argument("--steps",         type=int,   default=2000)
     parser.add_argument("--lr",            type=float, default=2e-4)
-    parser.add_argument("--temperature",   type=float, default=0.0,
-                        help="Distillation temperature (0=hard targets)")
+    parser.add_argument("--temperature",   type=float, default=2.0,
+                        help="Distillation temperature (>1=soft KL targets, 0=hard CE)")
     parser.add_argument("--max-seq-len",   type=int,   default=512)
     parser.add_argument("--save-dir",      type=str,   default="./checkpoints/thermo_draft")
     parser.add_argument("--log-every",     type=int,   default=50)

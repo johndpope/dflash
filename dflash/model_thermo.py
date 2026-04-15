@@ -20,7 +20,6 @@ internal attention is replaced.
 
 from __future__ import annotations
 
-import math
 from typing import Callable, Optional
 
 import torch
@@ -93,10 +92,13 @@ class ThermoGibbsSampler(nn.Module):
         self.beta_end   = beta_end
         self.scale      = head_dim ** -0.5
 
-        # Learned coupling matrix — projects keys into coupling space
-        # Initialised near identity so early training ≈ standard attention
+        # Learned coupling matrix — projects keys into coupling space.
+        # Near-zero init: J ≈ 0 at the start so coupling ≈ 0 and the Gibbs
+        # sampler's initial output ≈ standard attention.  The model can then
+        # gradually learn to use inter-token couplings without disrupting the
+        # pretrained Q/K/V weights from the start.
         self.J_proj = nn.Linear(head_dim, head_dim, bias=False)
-        nn.init.eye_(self.J_proj.weight)
+        nn.init.normal_(self.J_proj.weight, mean=0.0, std=0.01)
 
         # Learnable log-temperature offset (shared across heads via broadcasting)
         self.log_beta_offset = nn.Parameter(torch.zeros(1))
@@ -120,36 +122,50 @@ class ThermoGibbsSampler(nn.Module):
         h = q @ k.transpose(-2, -1) * self.scale          # (B, q_len, kv_len)
 
         # Coupling matrix: kv_len × kv_len key-key coupling
-        # J[b, i, j] = k[b,i] · W_J · k[b,j] — models how attending to key i
-        # should influence attending to key j (beyond what softmax captures)
+        # J[b,i,j] = k[b,i] · J_proj(k)[b,j] — models how key i
+        # should influence the weight on key j beyond what softmax captures.
         J_k = self.J_proj(k)                              # (B, kv_len, D)
         J   = k @ J_k.transpose(-2, -1) * self.scale      # (B, kv_len, kv_len)
         J   = torch.tanh(J)                               # bound couplings ∈ (-1,1)
 
-        # Mask (e.g. padding) — add -inf before first sigmoid
         if attention_mask is not None:
             h = h + attention_mask
 
-        # Initialise mean-field state with standard softmax (warm start)
+        beta_offset = (
+            float(torch.sigmoid(self.log_beta_offset).detach())
+            * (self.beta_end - self.beta_start)
+        )
+
+        # Try fused CUDA kernel first (compiled once, cached)
+        if q.is_cuda:
+            from .thermo_cuda_kernel import thermo_gibbs_cuda
+            out = thermo_gibbs_cuda(
+                h, J, v,
+                self.beta_start, self.beta_end, beta_offset,
+                self.n_steps,
+            )
+            if out is not None:
+                return out
+
+        # Vectorised PyTorch fallback (GPU or CPU)
+        #
+        # Potts mean-field TAP update (softmax form, not sigmoid):
+        #   m ← softmax(β · (m @ J + h))
+        #
+        # At J=0 this reduces to softmax(β·h), which for β=1 is exactly standard
+        # attention — so pretrained DFlash weights work without modification.
+        # As J_proj learns, the coupling enriches the attention beyond softmax.
         m = torch.softmax(h, dim=-1)                      # (B, q_len, kv_len)
 
-        # Annealed Gibbs refinement (TAP mean-field equations)
-        beta_offset = float(torch.sigmoid(self.log_beta_offset).detach()) * (self.beta_end - self.beta_start)
         for step in range(self.n_steps):
-            # Linear beta annealing: beta_start → beta_end
             frac   = step / max(self.n_steps - 1, 1)
             beta_t = self.beta_start + frac * (self.beta_end - self.beta_start) + beta_offset
 
-            # TAP update: coupling_term[b,q,j] = Σ_i m[b,q,i] * J[b,i,j]
-            # (B, q_len, kv_len) @ (B, kv_len, kv_len) → (B, q_len, kv_len)
-            coupling_term = m @ J
-            local_field   = beta_t * (coupling_term + h)
-            m_new         = torch.sigmoid(local_field)
+            # coupling[b, q, j] = Σ_i m[b, q, i] · J[b, i, j]
+            coupling = m @ J                              # (B, q_len, kv_len)
+            m        = torch.softmax(beta_t * (coupling + h), dim=-1)
 
-            # Normalize so attention weights sum to 1 (stays interpretable)
-            m = m_new / (m_new.sum(dim=-1, keepdim=True) + 1e-8)
-
-        return m @ v                                       # (B, q_len, D)
+        return m @ v                                      # (B, q_len, D)
 
 
 # ---------------------------------------------------------------------------
@@ -426,60 +442,75 @@ def thermo_distillation_loss(
     draft_hidden: torch.Tensor,
     target_lm_head: nn.Module,
     target_logits: torch.Tensor,
-    temperature: float = 1.0,
+    temperature: float = 2.0,
     gibbs_entropy_weight: float = 0.01,
     model: Optional[ThermoDFlashDraftModel] = None,
+    kl_weight: float = 0.9,
 ) -> dict[str, torch.Tensor]:
     """
     Compute distillation loss for ThermoDFlashDraftModel.
 
-    Two terms:
-    1. Token-level cross-entropy: draft predicts target's argmax tokens
-       (hard distillation — same as original DFlash training)
-    2. Thermodynamic entropy regularisation: encourage Gibbs chains to
-       have bounded variance across steps (stable sampling)
+    Three terms:
+    1. KL divergence on soft targets (temperature-scaled) — dense gradient
+       signal across the full vocabulary (dominant term, weight=kl_weight)
+    2. Hard cross-entropy on argmax targets — ensures top-1 accuracy
+       (weight=1-kl_weight)
+    3. Gibbs entropy regularisation — keep log_beta_offset near zero
+
+    Soft-target KL divergence (Hinton et al., 2015) converges far faster
+    than hard CE because every logit position contributes gradient, not just
+    the single argmax token.
 
     Args:
-        draft_hidden:         (B, seq, D) — output of ThermoDFlashDraftModel.forward()
-        target_lm_head:       the target model's lm_head projection
-        target_logits:        (B, seq, vocab) — target model logits (detached)
-        temperature:          sampling temperature (0 = hard targets)
-        gibbs_entropy_weight: weight for the entropy regularisation term
-        model:                if provided, compute Gibbs entropy regularisation
+        draft_hidden:         (B, seq, D)
+        target_lm_head:       target model's lm_head (not trained)
+        target_logits:        (B, seq, vocab) — detached target logits
+        temperature:          distillation temperature (>1 softens targets)
+        gibbs_entropy_weight: weight for Gibbs regularisation term
+        model:                ThermoDFlashDraftModel (for reg term)
+        kl_weight:            fraction of loss from KL vs hard CE (default 0.9)
 
     Returns:
-        dict with 'loss', 'ce_loss', 'entropy_reg'
+        dict with 'loss', 'ce_loss', 'kl_loss', 'entropy_reg'
     """
-    # Hard targets: argmax of target
+    import torch.nn.functional as F
+
+    draft_logits = target_lm_head(draft_hidden)                      # (B, seq, V)
+
+    # ── 1. KL divergence on soft (temperature-scaled) targets ────────────────
+    # Scale both sides by T; KL(p_teacher || p_student) × T² is the standard
+    # Hinton formulation that keeps gradient magnitude independent of T.
+    T = max(temperature, 1e-5)
     with torch.no_grad():
-        if temperature < 1e-5:
-            target_tokens = target_logits.argmax(dim=-1)            # (B, seq)
-        else:
-            target_probs  = torch.softmax(target_logits / temperature, dim=-1)
-            target_tokens = torch.multinomial(
-                target_probs.view(-1, target_probs.shape[-1]), 1
-            ).view(target_probs.shape[:-1])
+        p_teacher = F.softmax(target_logits.float() / T, dim=-1)     # (B, seq, V)
+    log_p_student = F.log_softmax(draft_logits.float() / T, dim=-1)  # (B, seq, V)
+    kl_loss = F.kl_div(
+        log_p_student.view(-1, log_p_student.shape[-1]),
+        p_teacher.view(-1, p_teacher.shape[-1]),
+        reduction="batchmean",
+    ) * (T ** 2)
 
-    # Draft logits via target's lm_head (shared vocabulary)
-    draft_logits = target_lm_head(draft_hidden)                     # (B, seq, vocab)
-
-    # Cross-entropy: draft learns to predict target tokens
-    ce_loss = torch.nn.functional.cross_entropy(
+    # ── 2. Hard CE on argmax token (ground-truth token accuracy) ─────────────
+    with torch.no_grad():
+        target_tokens = target_logits.argmax(dim=-1)                  # (B, seq)
+    ce_loss = F.cross_entropy(
         draft_logits.view(-1, draft_logits.shape[-1]),
         target_tokens.view(-1),
         ignore_index=-100,
     )
 
-    # Gibbs entropy regularisation (optional — needs model access)
+    # ── 3. Gibbs entropy regularisation ──────────────────────────────────────
     entropy_reg = torch.tensor(0.0, device=draft_hidden.device)
     if model is not None and gibbs_entropy_weight > 0:
-        # Encourage the Gibbs sampler's attention weights (m) to have
-        # reasonable entropy — not collapsed to one token, not uniform
         for layer in model.layers:
-            sampler = layer.self_attn.gibbs[0]  # representative head
-            # log_beta_offset should be near 0 (don't anneal too aggressively)
-            entropy_reg = entropy_reg + sampler.log_beta_offset.abs().mean()
-        entropy_reg = entropy_reg / len(model.layers)
+            for sampler in layer.self_attn.gibbs:
+                entropy_reg = entropy_reg + sampler.log_beta_offset.abs()
+        entropy_reg = entropy_reg / (len(model.layers) * len(model.layers[0].self_attn.gibbs))
 
-    loss = ce_loss + gibbs_entropy_weight * entropy_reg
-    return {"loss": loss, "ce_loss": ce_loss, "entropy_reg": entropy_reg}
+    loss = kl_weight * kl_loss + (1 - kl_weight) * ce_loss + gibbs_entropy_weight * entropy_reg
+    return {
+        "loss":        loss,
+        "ce_loss":     ce_loss,
+        "kl_loss":     kl_loss,
+        "entropy_reg": entropy_reg,
+    }
