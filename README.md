@@ -149,6 +149,94 @@ python -m dflash.benchmark --backend mlx \
     --dataset gsm8k --max-samples 128 --enable-thinking
 ```
 
+---
+
+## ThermoDFlash: Thermodynamic Attention Draft Model
+
+This fork adds **ThermoDFlash** — an experimental variant that replaces the softmax attention kernel inside the DFlash draft model with a **mean-field Ising Gibbs sampler** inspired by [Thermodynamic Natural Gradient Descent](https://arxiv.org/abs/2502.01598) and related thermodynamic computing work.
+
+### How it works
+
+Standard DFlash draft attention computes:
+
+```
+output = softmax(QKᵀ / √d) · V
+```
+
+ThermoDFlash replaces that single softmax pass with **annealed Gibbs refinement**:
+
+```
+h  = QKᵀ / √d               # external field (same as standard attention logits)
+J  = K · Wⱼ · Kᵀ / √d       # learned key-key coupling matrix
+m₀ = softmax(h)              # warm start
+
+for t in 0..n_steps:         # annealed mean-field TAP update
+    β_t = β_start + t/T · (β_end - β_start)
+    m   = sigmoid(β_t · (m @ J + h))
+    m   = m / m.sum(-1)      # normalise
+
+output = m · V
+```
+
+The key idea: **each Gibbs step lets the attention weights influence each other** via the coupling matrix J (beyond what a single softmax pass captures), converging toward a lower-energy, globally more coherent token proposal.
+
+### Benchmark results (RTX 5090, Qwen3-1.7B, 100 distillation steps)
+
+**Kernel speed vs SDPA:**
+
+| Config | SDPA | ThermoDFlash | Overhead |
+|---|---|---|---|
+| B=4 q=4 kv=32 D=64 steps=1 | 0.008ms | 0.107ms | 13x |
+| B=4 q=4 kv=32 D=64 steps=4 | 0.008ms | 0.208ms | 25x |
+| B=1 q=4 kv=256 D=128 steps=4 | 0.011ms | 0.212ms | 20x |
+
+**Draft model forward throughput:**
+
+| Model | tok/s | Params |
+|---|---|---|
+| DFlash (softmax baseline) | 124,869 | 67.1M |
+| ThermoDFlash n_gibbs=1 | 18,385 | 67.4M |
+| ThermoDFlash n_gibbs=4 | 18,841 | 67.4M |
+| ThermoDFlash n_gibbs=8 | 18,470 | 67.4M |
+
+**Speculative decoding (100 distillation steps, block_size=4):**
+
+| Metric | Value |
+|---|---|
+| Baseline throughput | 82.4 tok/s |
+| ThermoDFlash throughput | 58.9 tok/s |
+| Avg acceptance length | 1.08 / 4 |
+| Speedup | 0.72x |
+
+### Current status and next steps
+
+The 100-step distillation run produces an acceptance length of 1.08 — close to the untrained baseline of 1.0. The kernel overhead (~20x vs SDPA) is the primary bottleneck at this scale. To be competitive, ThermoDFlash needs:
+
+1. **More distillation** — the original DFlash models train for thousands of steps; 100 is just a proof of life
+2. **Fused Gibbs kernel** — the per-step sigmoid + matmul loop in Python is slow; a fused CUDA/Triton kernel collapses n_steps overhead significantly
+3. **Larger target models** — the acceptance rate benefit of better proposals compounds more at larger model sizes where token prediction is harder
+
+### Usage
+
+```python
+# Drop-in replacement for DFlashDraftModel
+from dflash.model_thermo import ThermoDFlashDraftModel as DFlashDraftModel
+from dflash.model_thermo import dflash_generate
+
+# Train
+python train_thermo_dflash.py \
+  --target Qwen/Qwen3-4B \
+  --dataset gsm8k \
+  --n-gibbs-steps 4 \
+  --steps 2000 \
+  --save-dir ./checkpoints/thermo_draft
+
+# Benchmark
+python bench_thermo.py --target Qwen/Qwen3-1.7B --train-steps 200
+```
+
+---
+
 ## Acknowledgement
 
 Huge thanks to [@dcw02](https://github.com/dcw02), [@gongy](https://github.com/gongy), and the team at [@modal-labs](https://github.com/modal-labs) for their fast, high-quality support in bringing DFlash to SGLang. And huge thanks as well to [@benchislett](https://github.com/benchislett) at NVIDIA for his work in bringing DFlash to vLLM and helping make it available to the broader serving community.

@@ -165,7 +165,9 @@ def bench_draft_forward(target_hidden_size=2048, target_layers=28):
 
         noise_emb   = torch.randn(B, seq, H,           device=DEVICE, dtype=DTYPE)
         tgt_hidden  = torch.randn(B, seq, H * n_target, device=DEVICE, dtype=DTYPE)
-        pos_ids     = torch.arange(seq, device=DEVICE).unsqueeze(0)
+        # position_ids must span ctx_len + q_len (both target_hidden and noise positions)
+        # so RoPE cos/sin covers the full kv sequence length
+        pos_ids     = torch.arange(seq * 2, device=DEVICE).unsqueeze(0)
 
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
 
@@ -282,7 +284,9 @@ def bench_acceptance(args):
 
             noise_ids = torch.full_like(ids, dcfg.dflash_config["mask_token_id"])
             noise_emb = target.model.embed_tokens(noise_ids)
-            pos_ids   = torch.arange(seq_len, device=DEVICE).unsqueeze(0)
+            # pos_ids must span ctx_len + q_len so RoPE covers the full kv sequence
+            # (target_hidden and noise are both used as keys → 2 * seq_len positions)
+            pos_ids   = torch.arange(2 * seq_len, device=DEVICE).unsqueeze(0)
 
             draft_hidden = draft(
                 position_ids=pos_ids,
