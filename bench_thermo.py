@@ -220,31 +220,38 @@ def bench_acceptance(args):
     tcfg = target.config
     print(f"  {tcfg.num_hidden_layers}L hidden={tcfg.hidden_size} heads={tcfg.num_attention_heads}")
 
-    # ── Build draft ───────────────────────────────────────────────────────────
-    target_layer_ids = build_target_layer_ids(tcfg.num_hidden_layers, args.draft_layers)
-    dcfg = Qwen3Config(
-        hidden_size=tcfg.hidden_size,
-        num_hidden_layers=args.draft_layers,
-        num_attention_heads=tcfg.num_attention_heads,
-        num_key_value_heads=tcfg.num_key_value_heads,
-        intermediate_size=tcfg.intermediate_size,
-        rms_norm_eps=tcfg.rms_norm_eps,
-        vocab_size=tcfg.vocab_size,
-        attention_bias=getattr(tcfg, "attention_bias", False),
-        attention_dropout=getattr(tcfg, "attention_dropout", 0.0),
-        sliding_window=None,
-        layer_types=["full_attention"] * args.draft_layers,
-        rope_theta=getattr(tcfg, "rope_theta", 10000.0),
-    )
-    dcfg.num_target_layers = tcfg.num_hidden_layers
-    dcfg.dflash_config = {
-        "target_layer_ids": target_layer_ids,
-        "block_size": args.block_size,
-        "mask_token_id": tcfg.vocab_size - 1,
-        "n_gibbs_steps": args.n_gibbs_steps,
-        "beta_start": args.beta_start,
-        "beta_end": args.beta_end,
-    }
+    # ── Build or load draft ───────────────────────────────────────────────────
+    if args.load_thermo:
+        print(f"\nLoading ThermoDFlash from checkpoint: {args.load_thermo}")
+        draft = ThermoDFlashDraftModel.from_pretrained(
+            args.load_thermo, torch_dtype=DTYPE,
+        ).to(DEVICE).eval()
+        dcfg = draft.config
+    else:
+        target_layer_ids = build_target_layer_ids(tcfg.num_hidden_layers, args.draft_layers)
+        dcfg = Qwen3Config(
+            hidden_size=tcfg.hidden_size,
+            num_hidden_layers=args.draft_layers,
+            num_attention_heads=tcfg.num_attention_heads,
+            num_key_value_heads=tcfg.num_key_value_heads,
+            intermediate_size=tcfg.intermediate_size,
+            rms_norm_eps=tcfg.rms_norm_eps,
+            vocab_size=tcfg.vocab_size,
+            attention_bias=getattr(tcfg, "attention_bias", False),
+            attention_dropout=getattr(tcfg, "attention_dropout", 0.0),
+            sliding_window=None,
+            layer_types=["full_attention"] * args.draft_layers,
+            rope_theta=getattr(tcfg, "rope_theta", 10000.0),
+        )
+        dcfg.num_target_layers = tcfg.num_hidden_layers
+        dcfg.dflash_config = {
+            "target_layer_ids": target_layer_ids,
+            "block_size": args.block_size,
+            "mask_token_id": tcfg.vocab_size - 1,
+            "n_gibbs_steps": args.n_gibbs_steps,
+            "beta_start": args.beta_start,
+            "beta_end": args.beta_end,
+        }
     dcfg.block_size = args.block_size
 
     draft = ThermoDFlashDraftModel(dcfg).to(DEVICE).to(DTYPE)
