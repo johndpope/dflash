@@ -153,7 +153,22 @@ def train(args):
           f"hidden={target_config.hidden_size}, vocab={target_config.vocab_size}")
 
     # ── Build draft model ─────────────────────────────────────────────────────
-    if args.pretrained_dflash:
+    if args.resume_from:
+        # Continue training an existing ThermoDFlash checkpoint
+        print(f"Resuming ThermoDFlash from: {args.resume_from}")
+        draft = ThermoDFlashDraftModel.from_pretrained(
+            args.resume_from, torch_dtype=torch.bfloat16,
+        )
+        draft_config = draft.config
+        # Override block_size if caller changed it (e.g. 4→8)
+        draft_config.block_size = args.block_size
+        if hasattr(draft_config, "dflash_config"):
+            draft_config.dflash_config["block_size"] = args.block_size
+        pretrained_layers = len(draft.layers)
+        if pretrained_layers != args.draft_layers:
+            print(f"  Note: checkpoint has {pretrained_layers} layers → using that")
+            args.draft_layers = pretrained_layers
+    elif args.pretrained_dflash:
         print(f"Loading pretrained DFlash model: {args.pretrained_dflash}")
         from dflash.model import DFlashDraftModel
 
@@ -182,21 +197,6 @@ def train(args):
         print(f"  Converted DFlash → ThermoDFlash")
         print(f"    Missing keys (new, near-zero init): {len(missing_keys)}")
         print(f"    Unexpected keys (ignored):          {len(unexpected_keys)}")
-
-        # All params train, but at different rates:
-        #   Gibbs params (J_proj, log_beta_offset): high LR — learn coupling fast
-        #   DFlash backbone (Q/K/V/O, MLPs, norms): tiny LR — barely moves,
-        #     but does adapt to the new sigmoid-based attention mechanism.
-        # Pure freezing fails because downstream layers were trained for softmax
-        # attention output; the sigmoid Gibbs output is numerically different.
-        gibbs_param_names = {n for n, _ in draft.named_parameters()
-                             if "gibbs" in n}
-        n_gibbs    = sum(p.numel() for n, p in draft.named_parameters()
-                         if n in gibbs_param_names)
-        n_backbone = sum(p.numel() for n, p in draft.named_parameters()
-                         if n not in gibbs_param_names)
-        print(f"    Gibbs params (high LR):             {n_gibbs/1e6:.2f}M")
-        print(f"    Backbone params (tiny LR):          {n_backbone/1e6:.1f}M")
     else:
         print(f"Building ThermoDFlashDraftModel from scratch ({args.draft_layers} layers, "
               f"{args.n_gibbs_steps} Gibbs steps, β={args.beta_start}→{args.beta_end})")
@@ -211,7 +211,7 @@ def train(args):
     print(f"  Draft trainable params: {n_params/1e6:.2f}M")
 
     # ── Optimizer — differential LR ──────────────────────────────────────────
-    if args.pretrained_dflash:
+    if args.pretrained_dflash or args.resume_from:
         # Gibbs params: train at full LR (they're new, need to learn fast)
         # Backbone params: train at LR/200 (barely move, just adapt to sigmoid attn)
         gibbs_param_names = {n for n, _ in draft.named_parameters() if "gibbs" in n}
@@ -226,11 +226,16 @@ def train(args):
         optimizer = AdamW(draft.parameters(), lr=args.lr, weight_decay=1e-2)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=args.lr * 0.05)
 
-    # ── Dataset ───────────────────────────────────────────────────────────────
-    print(f"Loading dataset: {args.dataset}")
-    dataset = load_and_process_dataset(args.dataset)
+    # ── Dataset (supports comma-separated mix, e.g. "gsm8k,math500,humaneval") ─
+    dataset_names = [d.strip() for d in args.dataset.split(",")]
+    dataset = []
+    for ds_name in dataset_names:
+        print(f"Loading dataset: {ds_name}")
+        ds = load_and_process_dataset(ds_name)
+        dataset.extend(ds)
+        print(f"  +{len(ds)} samples ({ds_name})")
     random.shuffle(dataset)
-    print(f"  {len(dataset)} samples")
+    print(f"  Total: {len(dataset)} samples")
 
     target_layer_ids = draft_config.dflash_config["target_layer_ids"]
     mask_token_id    = draft_config.dflash_config["mask_token_id"]
@@ -322,9 +327,9 @@ def train(args):
             optimizer.step()
             scheduler.step()
 
-            losses.append(float(losses_dict["loss"]))
-            ce_losses.append(float(losses_dict["ce_loss"]))
-            kl_losses.append(float(losses_dict.get("kl_loss", 0.0)))
+            losses.append(losses_dict["loss"].detach().item())
+            ce_losses.append(losses_dict["ce_loss"].detach().item())
+            kl_losses.append(losses_dict.get("kl_loss", torch.tensor(0.0)).detach().item())
 
         except torch.cuda.OutOfMemoryError:
             optimizer.zero_grad()
@@ -388,6 +393,8 @@ def main():
                         help="Target HuggingFace model ID")
     parser.add_argument("--pretrained-dflash", type=str, default=None,
                         help="Path to pretrained DFlash model to distill from (optional)")
+    parser.add_argument("--resume-from",   type=str,   default=None,
+                        help="Resume training from a ThermoDFlash checkpoint")
     parser.add_argument("--draft-layers",  type=int,   default=1,
                         help="Number of decoder layers in draft model (default 1)")
     parser.add_argument("--load-8bit",     action="store_true",
@@ -409,7 +416,8 @@ def main():
 
     # Training
     parser.add_argument("--dataset",       type=str,   default="gsm8k",
-                        choices=["gsm8k", "math500", "humaneval", "mbpp", "mt-bench"])
+                        help="Dataset(s) to train on, comma-separated "
+                             "(choices: gsm8k, math500, humaneval, mbpp, mt-bench)")
     parser.add_argument("--steps",         type=int,   default=2000)
     parser.add_argument("--lr",            type=float, default=2e-4)
     parser.add_argument("--temperature",   type=float, default=2.0,
