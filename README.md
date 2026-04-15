@@ -153,7 +153,7 @@ python -m dflash.benchmark --backend mlx \
 
 ## ThermoDFlash: Thermodynamic Attention Draft Model
 
-This fork adds **ThermoDFlash** — an experimental variant that replaces the softmax attention kernel inside the DFlash draft model with a **mean-field Ising Gibbs sampler** inspired by [Thermodynamic Natural Gradient Descent](https://arxiv.org/abs/2502.01598) and related thermodynamic computing work.
+This fork adds **ThermoDFlash** — an experimental variant that replaces the softmax attention kernel inside the DFlash draft model with a **mean-field Ising Gibbs sampler** inspired by [Thermodynamic Natural Gradient Descent](https://arxiv.org/html/2510.23972v1) and related thermodynamic computing work.
 
 ### How it works
 
